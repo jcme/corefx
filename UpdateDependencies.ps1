@@ -3,34 +3,20 @@
 # Licensed under the MIT license. See LICENSE file in the project root for full license information.
 #
 
-function EnsureEnvironmentVariable([string]$envVarName)
-{
-    If ([Environment]::GetEnvironmentVariable($envVarName) -eq $null)
-    {
-        throw "Can't find environment variable '$envVarName'"
-    }
-}
+# This script updates all the project.json files with the latest CoreFX build version,
+# and then creates a Pull Request for the change.
 
-function SetEnvIfDefault([string]$envVarName, [string]$value)
-{
-    If ([Environment]::GetEnvironmentVariable($envVarName) -eq $null)
-    {
-        [Environment]::SetEnvironmentVariable($envVarName, $value)
-    }
-}
+param(
+    [Parameter(Mandatory=$true)][string]$GitHubUser,
+    [Parameter(Mandatory=$true)][string]$GitHubEmail,
+    [Parameter(Mandatory=$true)][string]$GitHubPassword,
+    [string]$CoreFxVersionUrl='https://raw.githubusercontent.com/dotnet/versions/master/dotnet/corefx/master/Latest.txt', 
+    [string]$GitHubUpstreamOwner='dotnet', 
+    [string]$GitHubOriginOwner=$GitHubUser,
+    [string]$GitHubProject='corefx',
+    [string]$GitHubUpstreamBranch='master')
 
-EnsureEnvironmentVariable "GITHUB_USER"
-EnsureEnvironmentVariable "GITHUB_EMAIL"
-EnsureEnvironmentVariable "GITHUB_PASSWORD"
-
-SetEnvIfDefault 'COREFX_VERSION_URL' 'https://raw.githubusercontent.com/dotnet/versions/master/dotnet/corefx/master/Latest.txt'
-SetEnvIfDefault 'GITHUB_ORIGIN_OWNER' $env:GITHUB_USER
-SetEnvIfDefault 'GITHUB_UPSTREAM_OWNER' 'dotnet'
-SetEnvIfDefault 'GITHUB_PROJECT' 'corefx'
-SetEnvIfDefault 'GITHUB_UPSTREAM_BRANCH' 'master'
-
-
-$CoreFxLatestVersion = Invoke-WebRequest $env:COREFX_VERSION_URL -UseBasicParsing
+$CoreFxLatestVersion = Invoke-WebRequest $CoreFxVersionUrl -UseBasicParsing
 $CoreFxLatestVersion = $CoreFxLatestVersion.ToString().Trim()
 
 # Updates the dir.props file with the latest CoreFX build number
@@ -38,18 +24,17 @@ function UpdateValidDependencyVersionsFile
 {
     if (!$CoreFxLatestVersion)
     {
-        Write-Error "Unable to find latest CoreFX version at $env:COREFX_VERSION_URL"
+        Write-Error "Unable to find latest CoreFX version at $CoreFxVersionUrl"
         return $false
     }
 
     $DirPropsPath = "$PSScriptRoot\dir.props"
-    $DirPropsText = [IO.File]::ReadAllText($DirPropsPath)
+    
+    $DirPropsContent = Get-Content $DirPropsPath | % { 
+        $_ -replace "<CoreFxExpectedPrerelease>.*</CoreFxExpectedPrerelease>","<CoreFxExpectedPrerelease>$CoreFxLatestVersion</CoreFxExpectedPrerelease>"
+    }
+    Set-Content $DirPropsPath $DirPropsContent
 
-    $CoreFxRegex = new-object Text.RegularExpressions.Regex '<CoreFxExpectedPrerelease>.*</CoreFxExpectedPrerelease>'
-
-    $DirPropsText = $CoreFxRegex.Replace($DirPropsText, "<CoreFxExpectedPrerelease>$CoreFxLatestVersion</CoreFxExpectedPrerelease>")
-
-    [IO.File]::WriteAllText($DirPropsPath, $DirPropsText)
     return $true
 }
 
@@ -64,37 +49,40 @@ function RunUpdatePackageDependencyVersions
 # Creates a Pull Request for the updated version numbers
 function CreatePullRequest
 {
-    git add . | Out-Host
-
-    $UserName = $env:GITHUB_USER
-    $Email = $env:GITHUB_EMAIL
     $CommitMessage = "Updating CoreFX dependencies to $CoreFxLatestVersion"
 
-    $env:GIT_COMMITTER_NAME = $UserName
-    $env:GIT_COMMITTER_EMAIL = $Email
-    git commit -m "$CommitMessage" --author "$UserName <$Email>" | Out-Host
+    $env:GIT_COMMITTER_NAME = $GitHubUser
+    $env:GIT_COMMITTER_EMAIL = $GitHubEmail
+    $CommitOutput = git commit -a -m "$CommitMessage" --author "$GitHubUser <$GitHubEmail>"
+    Write-Host $CommitOutput
 
-    $RemoteUrl = "github.com/$env:GITHUB_ORIGIN_OWNER/$env:GITHUB_PROJECT.git"
+    if ($($CommitOutput | Select-String -Pattern 'nothing to commit').count -eq 1)
+    {
+        Write-Warning "Dependencies are currently up to date"
+        return $true
+    }
+
+    $RemoteUrl = "github.com/$GitHubOriginOwner/$GitHubProject.git"
     $RemoteBranchName = "UpdateDependencies$([DateTime]::UtcNow.ToString('yyyyMMddhhmmss'))"
     $RefSpec = "HEAD:refs/heads/$RemoteBranchName"
 
     Write-Host "git push https://$RemoteUrl $RefSpec"
     # pipe this to null so the password secret isn't in the logs
-    git push "https://$($UserName):$env:GITHUB_PASSWORD@$RemoteUrl" $RefSpec 2>&1 | Out-Null
+    git push "https://$($GitHubUser):$GitHubPassword@$RemoteUrl" $RefSpec 2>&1 | Out-Null
 
     $CreatePRBody = @"
     {
         "title": "$CommitMessage", 
-        "head": "$($env:GITHUB_ORIGIN_OWNER):$RemoteBranchName", 
-        "base": "$env:GITHUB_UPSTREAM_BRANCH" 
+        "head": "$($GitHubOriginOwner):$RemoteBranchName", 
+        "base": "$GitHubUpstreamBranch" 
     }
 "@
 
-    $CreatePRHeaders = @{'Accept'='application/vnd.github.v3+json'; 'Authorization'="token $env:GITHUB_PASSWORD"}
+    $CreatePRHeaders = @{'Accept'='application/vnd.github.v3+json'; 'Authorization'="token $GitHubPassword"}
 
     try
     {
-        Invoke-WebRequest https://api.github.com/repos/$env:GITHUB_UPSTREAM_OWNER/$env:GITHUB_PROJECT/pulls -UseBasicParsing -Method Post -Body $CreatePRBody -Headers $CreatePRHeaders
+        Invoke-WebRequest https://api.github.com/repos/$GitHubUpstreamOwner/$GitHubProject/pulls -UseBasicParsing -Method Post -Body $CreatePRBody -Headers $CreatePRHeaders
     }
     catch
     {
